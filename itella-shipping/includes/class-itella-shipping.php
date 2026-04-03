@@ -155,7 +155,9 @@ class Itella_Shipping
 
     add_action('plugins_loaded', array($this, 'run'));
     add_action('admin_notices', array($this, 'notify_on_activation'));
-    add_action('woocommerce_after_register_post_type', array($this, 'update_database'));
+    add_action('admin_notices', array($this, 'notify_db_migration'));
+    add_action('admin_init', array($this, 'check_database_update'));
+    add_action('wp_ajax_itella_migrate_orders', array($this, 'ajax_migrate_orders'));
 
     self::$instance = $this;
   }
@@ -495,35 +497,172 @@ class Itella_Shipping
     $this->load_dependencies();
   }
 
-  public function update_database()
+  public function check_database_update()
   {
     $updated = get_option('itella_updated');
-    if ( empty($updated) || version_compare($this->version, '1.4.4', '<') ) {
-      $orders = wc_get_orders(array(
+
+    if ( ! empty($updated) && version_compare($updated, '1.4.4', '>=') ) {
+      return;
+    }
+
+    if ( get_option('itella_db_migration_needed') === 'yes' ) {
+      return;
+    }
+
+    // Check if there are any old meta keys to migrate
+    $orders_to_migrate = wc_get_orders(array(
+      'limit' => 1,
+      'meta_key' => '_itella_method',
+      'meta_compare' => 'EXISTS',
+      'return' => 'ids',
+    ));
+
+    if ( empty($orders_to_migrate) ) {
+      update_option('itella_updated', $this->version, false);
+      return;
+    }
+
+    update_option('itella_db_migration_needed', 'yes', false);
+  }
+
+  public function notify_db_migration()
+  {
+    if ( get_option('itella_db_migration_needed') !== 'yes' ) {
+      return;
+    }
+    $nonce = wp_create_nonce('itella_migrate_orders');
+    ?>
+    <div class="notice notice-warning" id="itella-migration-notice" style="border-left-color:#d63638; padding:12px 16px;">
+      <p style="font-size:14px; margin:0 0 10px;">
+        <strong><?php _e('Smartposti Shipping', 'itella-shipping'); ?>:</strong>
+        <?php _e('Updating orders database. Please do not close this page...', 'itella-shipping'); ?>
+      </p>
+      <div id="itella-migration-progress">
+        <p style="margin:0 0 6px;"><span id="itella-migration-status"><?php _e('Starting...', 'itella-shipping'); ?></span></p>
+        <div style="background:#e0e0e0; height:20px; border-radius:3px; overflow:hidden; max-width:400px;">
+          <div id="itella-migration-bar" style="background:#0073aa; height:100%; width:0%; transition:width 0.3s;"></div>
+        </div>
+      </div>
+    </div>
+    <script>
+    (function() {
+      var notice = document.getElementById('itella-migration-notice');
+      if (!notice) return;
+      runBatch(1);
+      function runBatch(page) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '<?php echo esc_url(admin_url('admin-ajax.php')); ?>');
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        xhr.onload = function() {
+          if (xhr.status === 200) {
+            try {
+              var r = JSON.parse(xhr.responseText);
+              if (r.success && r.data) {
+                var d = r.data;
+                var status = document.getElementById('itella-migration-status');
+                var bar = document.getElementById('itella-migration-bar');
+                if (d.done) {
+                  bar.style.width = '100%';
+                  notice.style.borderLeftColor = '#00a32a';
+                  status.textContent = d.message;
+                  setTimeout(function() { notice.style.display = 'none'; }, 5000);
+                } else {
+                  if (d.total > 0) {
+                    window.itellaMigrationTotal = d.total;
+                    bar.style.width = Math.round((d.processed / d.total) * 100) + '%';
+                  }
+                  status.textContent = d.message;
+                  runBatch(d.next_page);
+                }
+              } else {
+                document.getElementById('itella-migration-status').textContent = 'Error: ' + (r.data || 'Unknown error');
+              }
+            } catch(e) {
+              document.getElementById('itella-migration-status').textContent = 'Error processing response';
+            }
+          }
+        };
+        xhr.send('action=itella_migrate_orders&nonce=<?php echo $nonce; ?>&page=' + page + '&total=' + (window.itellaMigrationTotal || 0));
+      }
+    })();
+    </script>
+    <?php
+  }
+
+  public function ajax_migrate_orders()
+  {
+    check_ajax_referer('itella_migrate_orders', 'nonce');
+
+    if ( ! current_user_can('manage_woocommerce') ) {
+      wp_send_json_error('Unauthorized');
+    }
+
+    $page = isset($_POST['page']) ? absint($_POST['page']) : 1;
+    $batch_size = 50;
+    $known_total = isset($_POST['total']) ? absint($_POST['total']) : 0;
+
+    $wc = new Itella_Shipping_Wc_Itella();
+
+    $orders = wc_get_orders(array(
+      'limit' => $batch_size,
+      'page' => $page,
+      'meta_key' => '_itella_method',
+      'meta_compare' => 'EXISTS'
+    ));
+
+    if ( empty($orders) ) {
+      update_option('itella_updated', $this->version, false);
+      delete_option('itella_db_migration_needed');
+      wp_send_json_success(array(
+        'done' => true,
+        'message' => __('Update completed successfully!', 'itella-shipping'),
+      ));
+    }
+
+    // Get total only on first batch to avoid heavy query each time
+    if ( $known_total > 0 ) {
+      $total = $known_total;
+    } else {
+      $total_orders = wc_get_orders(array(
         'limit' => -1,
         'meta_key' => '_itella_method',
-        'meta_compare' => 'EXISTS'
+        'meta_compare' => 'EXISTS',
+        'return' => 'ids',
       ));
-
-      $wc = new Itella_Shipping_Wc_Itella();
-      foreach ( $orders as $order ) {
-        $itella_data = $wc->get_itella_data($order);
-
-        $wc->save_itella_method($order, $itella_data->itella_method);
-        //$wc->delete_order_meta($order, '_itella_method');
-        $wc->save_itella_pp_id($order, $itella_data->pickup->id);
-        //$wc->delete_order_meta($order, '_pp_id');
-        $wc->save_itella_pp_code($order, $itella_data->pickup->pupcode);
-        //$wc->delete_order_meta($order, 'itella_pupCode');
-        $wc->save_itella_tracking_code($order, $itella_data->tracking->code);
-        //$wc->delete_order_meta($order, '_itella_tracking_code');
-        $wc->save_itella_tracking_url($order, $itella_data->tracking->url);
-        //$wc->delete_order_meta($order, '_itella_tracking_url');
-        $wc->save_itella_manifest_generation_date($order, $itella_data->manifest->date);
-        //$wc->delete_order_meta($order, '_itella_manifest_generation_date');
-      }
-      update_option('itella_updated', $this->version, false);
+      $total = count($total_orders);
     }
+
+    foreach ( $orders as $order ) {
+      $itella_data = $wc->get_itella_data($order);
+
+      $wc->save_itella_method($order, $itella_data->itella_method);
+      $wc->save_itella_pp_id($order, $itella_data->pickup->id);
+      $wc->save_itella_pp_code($order, $itella_data->pickup->pupcode);
+      $wc->save_itella_tracking_code($order, $itella_data->tracking->code);
+      $wc->save_itella_tracking_url($order, $itella_data->tracking->url);
+      $wc->save_itella_manifest_generation_date($order, $itella_data->manifest->date);
+    }
+
+    $processed = ($page - 1) * $batch_size + count($orders);
+    $has_more = count($orders) >= $batch_size;
+
+    if ( ! $has_more ) {
+      update_option('itella_updated', $this->version, false);
+      delete_option('itella_db_migration_needed');
+      wp_send_json_success(array(
+        'done' => true,
+        'message' => __('Update completed successfully!', 'itella-shipping'),
+      ));
+    }
+
+    wp_send_json_success(array(
+      'done' => false,
+      'next_page' => $page + 1,
+      'processed' => $processed,
+      'total' => $total,
+      /* translators: %1$d - processed orders count, %2$d - total orders count */
+      'message' => sprintf(__('Updated %1$d / %2$d orders...', 'itella-shipping'), $processed, $total),
+    ));
   }
 
   /**

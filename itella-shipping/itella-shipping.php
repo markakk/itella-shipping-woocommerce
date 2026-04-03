@@ -48,7 +48,7 @@ require_once plugin_dir_path( __FILE__ ) . 'includes/class-itella-shipping-deact
 register_activation_hook( __FILE__, array('Itella_Shipping_Activator', 'activate' ) );
 
 /** This action is documented in includes/class-itella-shipping-deactivator.php */
-register_activation_hook( __FILE__, array('Itella_Shipping_Deactivator', 'deactivate' ) );
+register_deactivation_hook( __FILE__, array('Itella_Shipping_Deactivator', 'deactivate' ) );
 
 /**
  * The core plugin class that is used to define internationalization,

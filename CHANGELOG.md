@@ -1,11 +1,18 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+- fixed deactivation hook which was incorrectly registered as activation hook
+- fixed memory exhaustion error when activating plugin on shops with many orders, caused by loading all orders at once during database migration
+- fixed version_compare bug in database migration that was comparing current plugin version instead of stored version
+
 ### Improved
 - improved PDF output of labels to avoid issues when the system sends additional data
 
 ### Changed
 - changed the name of the PDF file for labels to avoid issues with Headers and to match the plugin name
+- database migration now runs automatically via AJAX in batches of 50 orders with a progress bar, instead of blocking page load
+- database migration hook moved from 'woocommerce_after_register_post_type' to 'admin_init' to prevent issues with early execution
 
 ## [1.7.5] - 2026-03-12
 ### Fixed
